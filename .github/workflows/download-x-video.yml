@@ -1,0 +1,79 @@
+name: Download X Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      post_url:
+        description: 'X (Twitter) post URL containing video (e.g. https://x.com/username/status/123456789)'
+        required: true
+        type: string
+      max_size_mb:
+        description: 'Maximum allowable video file size in MB'
+        required: false
+        default: '75'
+        type: string
+
+concurrency:
+  group: download-x-video-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  download-video:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Ensure ffmpeg and ffprobe
+        run: |
+          if ! command -v ffmpeg &> /dev/null || ! command -v ffprobe &> /dev/null; then
+            echo "Installing ffmpeg..."
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          else
+            echo "ffmpeg and ffprobe are already installed:"
+            ffmpeg -version | head -n 1
+            ffprobe -version | head -n 1
+          fi
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Download and Validate Video
+        id: download_step
+        run: |
+          python -m src.downloader \
+            --url "${{ inputs.post_url }}" \
+            --max-size "${{ inputs.max_size_mb || '75' }}" \
+            --downloads-dir "downloads"
+
+      - name: Commit and Push Verified Video
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage only the downloads directory
+          git add downloads/
+
+          if git diff --staged --quiet; then
+            echo "Notice: No new files to commit. The video may already exist in downloads/."
+          else
+            git commit -m "feat(downloads): add video for post ${{ inputs.post_url }}"
+            
+            # Pull with rebase to ensure clean push without conflicts
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin "${{ github.ref_name }}"
+            echo "Successfully committed and pushed video to branch ${{ github.ref_name }}."
+          fi
