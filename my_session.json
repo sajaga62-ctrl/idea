@@ -1,1 +1,0 @@
-{"conversation_id":"227be089-2baa-49a7-b502-9ccb3c075777","status":"ERROR","response":"","error":"Error: empty prompt. Usage: agy --print \"your prompt here\"","duration_seconds":0.000134,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}

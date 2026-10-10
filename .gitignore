@@ -5,3 +5,5 @@ __pycache__/
 .coverage
 htmlcov/
 *.log
+
+my_session.json
