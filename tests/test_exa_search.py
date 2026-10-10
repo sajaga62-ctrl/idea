@@ -14,13 +14,16 @@ import pytest
 
 from src.exa_search import (
     DEFAULT_TOPICS,
+    SOCIAL_HINT,
     ExaSearchProvider,
     SearchProviderAuthError,
     SearchProviderError,
     SearchProviderExhaustedError,
     SearchProviderRateLimitError,
     X_DOMAINS,
+    build_keyword_templates,
     build_query_templates,
+    parse_search_keywords,
 )
 
 
@@ -206,6 +209,71 @@ class TestQueryTemplates:
 
     def test_blank_topics_are_skipped(self):
         assert build_query_templates(["", "  "]) == []
+
+
+class TestKeywordParsing:
+    def test_splits_on_commas(self):
+        assert parse_search_keywords("Claude Code, OpenAI Codex, AI coding agents") == [
+            "Claude Code",
+            "OpenAI Codex",
+            "AI coding agents",
+        ]
+
+    def test_trims_whitespace_and_drops_empty_entries(self):
+        assert parse_search_keywords("  Veo ,, , Sora ,  ") == ["Veo", "Sora"]
+
+    def test_preserves_user_casing_and_phrasing(self):
+        assert parse_search_keywords("Figure AI, OpenClaw") == ["Figure AI", "OpenClaw"]
+
+    def test_dedupes_case_insensitively_but_keeps_first(self):
+        assert parse_search_keywords("Veo, veo, VEO") == ["Veo"]
+
+    def test_newlines_also_separate(self):
+        assert parse_search_keywords("Sora\nRunway") == ["Sora", "Runway"]
+
+    @pytest.mark.parametrize("raw", ["", "   ", ",", ", ,", None])
+    def test_empty_or_invalid_yields_no_terms(self, raw):
+        assert parse_search_keywords(raw) == []
+
+
+class TestKeywordTemplates:
+    def test_semantic_query_is_the_keyword_verbatim(self):
+        templates = build_keyword_templates(["Claude Code"])
+        semantic = next(t for t in templates if t.label.startswith("semantic:"))
+        assert semantic.query == "Claude Code"
+        assert semantic.include_domains == ()
+
+    def test_domain_query_keeps_keyword_text_and_adds_x_filter(self):
+        templates = build_keyword_templates(["OpenClaw"])
+        domain = next(t for t in templates if t.label.startswith("domain:"))
+        assert domain.query == "OpenClaw"
+        assert domain.include_domains == X_DOMAINS
+
+    def test_social_query_is_keyword_plus_documented_source_hint(self):
+        templates = build_keyword_templates(["humanoid robots"])
+        social = next(t for t in templates if t.label.startswith("social:"))
+        assert social.query == f"humanoid robots {SOCIAL_HINT}"
+
+    def test_uses_every_supplied_keyword_and_nothing_else(self):
+        keywords = ["Veo", "Sora", "Runway", "AI video generation"]
+        templates = build_keyword_templates(keywords)
+        queries = {t.query for t in templates}
+        # Each keyword is searched verbatim.
+        for keyword in keywords:
+            assert keyword in queries
+        # No built-in/generic topic leaks in.
+        blob = " ".join(queries).lower()
+        for generic in DEFAULT_TOPICS:
+            assert generic.lower() not in blob
+
+    def test_blank_keywords_produce_no_templates(self):
+        assert build_keyword_templates(["", "  "]) == []
+
+    def test_variants_can_be_turned_off_to_search_only_the_keyword(self):
+        templates = build_keyword_templates(
+            ["Veo"], domain_filter=False, source_hint=False
+        )
+        assert [t.query for t in templates] == ["Veo"]
 
 
 # ---------------------------------------------------------------------------

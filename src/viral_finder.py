@@ -46,7 +46,8 @@ from src.exa_search import (
     SearchProviderError,
     SearchProviderExhaustedError,
     SearchProviderRateLimitError,
-    build_query_templates,
+    build_keyword_templates,
+    parse_search_keywords,
 )
 
 DEFAULT_MIN_VIEWS = 50_000
@@ -702,19 +703,21 @@ class DiscoveryStats:
 
 def discover_with_exa(
     provider: SearchProvider,
-    topics: Sequence[str] = DEFAULT_TOPICS,
+    keywords: Sequence[str] = DEFAULT_TOPICS,
     *,
     max_queries: int = DEFAULT_PER_RUN_QUERY_CAP,
     num_results: int = DEFAULT_EXA_NUM_RESULTS,
     start_published_date: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> Tuple[List[str], DiscoveryStats]:
-    """Discovers candidate X post URLs with a search provider (Exa).
+    """Discovers candidate X post URLs for the supplied search keywords.
 
-    Returns de-duplicated candidate URLs plus :class:`DiscoveryStats`.
-    Non-status results (profiles/homepages) are discarded and counted so query
-    templates can be tuned. Provider exhaustion or rate limiting stops the run
-    gracefully instead of retrying aggressively.
+    The keywords drive the search: each term is queried **verbatim** plus a
+    same-text domain-filtered variant and one source-hinted variant needed to
+    surface X posts via mirror pages. Returns de-duplicated candidate URLs plus
+    :class:`DiscoveryStats`. Non-status results are discarded and counted.
+    Provider exhaustion or rate limiting stops the run gracefully instead of
+    retrying aggressively.
     """
     stats = DiscoveryStats(provider=getattr(provider, "name", "unknown"))
 
@@ -723,7 +726,19 @@ def discover_with_exa(
         log("[INFO] Exa discovery skipped: no API key configured; falling back.")
         return [], stats
 
-    templates = build_query_templates(topics)
+    templates = build_keyword_templates(keywords)
+    if not templates:
+        stats.notes.append("no search keywords supplied")
+        log("[ERROR] No search keywords to query.")
+        return [], stats
+
+    # Be transparent: show exactly which queries the keywords produced.
+    log(
+        "[INFO] Search keywords: "
+        + ", ".join(k.strip() for k in keywords if k.strip())
+    )
+    log("[INFO] Exa queries: " + " | ".join(t.label for t in templates))
+
     candidates: List[str] = []
 
     for template in templates:
@@ -991,9 +1006,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exa API key (defaults to the EXA_API_KEY environment variable).",
     )
     parser.add_argument(
+        "--search-keywords",
+        default=None,
+        help=(
+            "Comma-separated search keywords you enter for this run (e.g. "
+            "'Claude Code, Veo, AI coding agents'). Drives discovery verbatim."
+        ),
+    )
+    parser.add_argument(
         "--topics",
         default="",
-        help="Comma-separated discovery topics (defaults to built-in seed topics).",
+        help=(
+            "Comma-separated discovery topics used only when --search-keywords "
+            "is not supplied (defaults to built-in seed topics)."
+        ),
     )
     parser.add_argument(
         "--per-run-query-cap",
@@ -1073,9 +1099,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[WARN] candidate file not found: {candidate_file}")
 
     if args.discover_exa:
+        # Custom keywords drive discovery. When --search-keywords is supplied it
+        # is authoritative; an explicitly empty/invalid value is a hard error
+        # rather than a silent fallback to generic queries.
+        if args.search_keywords is not None:
+            keywords = parse_search_keywords(args.search_keywords)
+            if not keywords:
+                print(
+                    "[ERROR] --search-keywords must contain at least one non-empty "
+                    "comma-separated term.",
+                    file=sys.stderr,
+                )
+                return 2
+        elif args.topics:
+            keywords = parse_search_keywords(args.topics) or list(DEFAULT_TOPICS)
+        else:
+            keywords = list(DEFAULT_TOPICS)
+
         api_key = args.exa_api_key or os.getenv("EXA_API_KEY", "")
         provider = ExaSearchProvider(api_key)
-        topics = [t.strip() for t in args.topics.split(",") if t.strip()] or list(DEFAULT_TOPICS)
         start_date = None
         if args.exa_since_hours > 0:
             start_date = (now - timedelta(hours=args.exa_since_hours)).replace(
@@ -1083,7 +1125,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ).isoformat()
         exa_candidates, exa_stats = discover_with_exa(
             provider,
-            topics,
+            keywords,
             max_queries=args.per_run_query_cap,
             num_results=args.exa_num_results,
             start_published_date=start_date,
@@ -1131,6 +1173,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pruned = prune_old_results(output_dir, args.retention_days, now)
 
     print("\n=== Summary ===")
+    if args.discover_exa and args.search_keywords is not None:
+        print(
+            "Search keywords            : "
+            + ", ".join(parse_search_keywords(args.search_keywords))
+        )
     if exa_stats is not None:
         print(
             f"Exa discovery               : {exa_stats.queries_run} queries, "

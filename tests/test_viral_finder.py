@@ -6,6 +6,7 @@ network blocks them they report ``blocked`` (skipped) instead of passing.
 """
 
 import json
+import os
 import socket
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ import pytest
 from src import viral_finder as vf
 from src.downloader import extract_post_id
 from src.exa_search import (
+    SOCIAL_HINT,
     SearchHit,
     SearchProviderError,
     SearchProviderExhaustedError,
@@ -601,6 +603,87 @@ class TestDiscoverWithExa:
 
 
 # ---------------------------------------------------------------------------
+# Custom keyword input (manual, every run)
+# ---------------------------------------------------------------------------
+
+
+class TestCustomKeywords:
+    def test_custom_keywords_reach_provider_search(self):
+        provider = FakeProvider(hits=[])
+        vf.discover_with_exa(
+            provider, ["Claude Code", "Veo"], max_queries=6, log=lambda _m: None
+        )
+        assert len(provider.calls) == 6
+        # Each keyword is searched verbatim and with the documented source hint.
+        assert "Claude Code" in provider.calls
+        assert f"Claude Code {SOCIAL_HINT}" in provider.calls
+        assert "Veo" in provider.calls
+        assert f"Veo {SOCIAL_HINT}" in provider.calls
+        # No built-in/generic AI demo query leaked in.
+        assert not any("frontier AI model release" in q for q in provider.calls)
+
+    def test_keywords_are_searched_verbatim_plus_documented_variants(self):
+        provider = FakeProvider(hits=[])
+        vf.discover_with_exa(provider, ["Figure AI"], max_queries=3, log=lambda _m: None)
+        assert provider.calls == ["Figure AI", "Figure AI", f"Figure AI {SOCIAL_HINT}"]
+
+    def test_query_budget_enforced_across_keywords(self):
+        provider = FakeProvider(hits=[])
+        _candidates, stats = vf.discover_with_exa(
+            provider, ["a", "b", "c", "d"], max_queries=5, log=lambda _m: None
+        )
+        assert stats.queries_run == 5
+        assert len(provider.calls) == 5
+
+    def test_no_keywords_yields_no_templates(self):
+        provider = FakeProvider(hits=[])
+        candidates, stats = vf.discover_with_exa(provider, [], log=lambda _m: None)
+        assert candidates == []
+        assert provider.calls == []
+        assert any("no search keywords" in note for note in stats.notes)
+
+
+class TestMainWithKeywords:
+    def test_empty_search_keywords_is_a_clear_error(self, capsys):
+        code = vf.main(["--discover-exa", "--search-keywords", " , , "])
+        assert code == 2
+        assert "search-keywords" in capsys.readouterr().err
+
+    def test_main_passes_user_keywords_to_exa(self, monkeypatch, tmp_path):
+        recorded = {}
+
+        class RecordingProvider:
+            name = "recording"
+
+            def __init__(self, api_key):
+                self.total_cost_usd = 0.0
+
+            def is_configured(self):
+                return True
+
+            def search(self, query, **kwargs):
+                recorded.setdefault("queries", []).append(query)
+                return []
+
+        monkeypatch.setattr(vf, "ExaSearchProvider", RecordingProvider)
+        code = vf.main(
+            [
+                "--discover-exa",
+                "--search-keywords",
+                "Gemini 3, Veo, Runway",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+        assert code == 0
+        queries = recorded["queries"]
+        assert "Gemini 3" in queries
+        assert "Veo" in queries
+        assert "Runway" in queries
+        assert not any("frontier AI model release" in q for q in queries)
+
+
+# ---------------------------------------------------------------------------
 # Retention pruning
 # ---------------------------------------------------------------------------
 
@@ -669,6 +752,25 @@ def test_integration_real_x_metadata_extraction():
 
     # The video stream must be publicly fetchable without bypassing anything.
     assert vf.check_video_accessible(metadata["info"]) is True
+
+
+@pytest.mark.integration
+def test_integration_custom_keywords_live_search():
+    """One small live Exa query proving user keywords reach the real API."""
+    api_key = os.getenv("EXA_API_KEY")
+    if not api_key:
+        pytest.skip("BLOCKED: EXA_API_KEY not set; live keyword search not exercised")
+
+    provider = vf.ExaSearchProvider(api_key)
+    try:
+        candidates, stats = vf.discover_with_exa(
+            provider, ["Claude Code"], max_queries=1, num_results=3, log=lambda _m: None
+        )
+    except vf.SearchProviderError as exc:
+        pytest.skip(f"BLOCKED: Exa unreachable from this environment ({exc})")
+
+    assert stats.queries_run == 1
+    assert isinstance(candidates, list)
 
 
 @pytest.mark.integration

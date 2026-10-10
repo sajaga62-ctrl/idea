@@ -17,6 +17,7 @@ This module defines:
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -251,6 +252,60 @@ class QueryTemplate:
     label: str
     query: str
     include_domains: Tuple[str, ...] = ()
+
+
+def parse_search_keywords(raw: Optional[str]) -> List[str]:
+    """Splits user-supplied keywords into clean, ordered, unique terms.
+
+    Commas (and newlines) separate terms; surrounding whitespace is trimmed and
+    empty entries are dropped. The user's terms are preserved exactly — no
+    substitution or lower-casing of the returned text.
+    """
+    if not raw or not isinstance(raw, str):
+        return []
+    terms: List[str] = []
+    seen = set()
+    for part in re.split(r"[,\n]", raw):
+        term = part.strip()
+        if not term:
+            continue
+        key = term.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    return terms
+
+
+def build_keyword_templates(
+    keywords: Sequence[str],
+    *,
+    domain_filter: bool = True,
+    source_hint: bool = True,
+    hint: str = SOCIAL_HINT,
+) -> List[QueryTemplate]:
+    """Builds Exa queries strictly from the supplied keywords.
+
+    The keyword text is used **verbatim** for the ``semantic`` and ``domain``
+    queries (the latter just adds an X-host filter, it does not change the text).
+    The ``social`` query appends a *source hint* — not a topic — because Exa
+    does not index ``x.com`` status pages directly, so the hint is what lets
+    mirror/aggregator pages that embed the post id surface. Nothing else is
+    added.
+    """
+    templates: List[QueryTemplate] = []
+    for keyword in keywords:
+        clean = keyword.strip()
+        if not clean:
+            continue
+        templates.append(QueryTemplate(label=f"semantic:{clean}", query=clean))
+        if domain_filter:
+            templates.append(
+                QueryTemplate(label=f"domain:{clean}", query=clean, include_domains=X_DOMAINS)
+            )
+        if source_hint:
+            templates.append(QueryTemplate(label=f"social:{clean}", query=f"{clean} {hint}"))
+    return templates
 
 
 def build_query_templates(

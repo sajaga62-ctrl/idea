@@ -4,10 +4,9 @@ name: Find Viral X AI-Demo Links
 on:
   workflow_dispatch:
     inputs:
-      topics:
-        description: 'Comma-separated discovery topics (blank = built-in seed topics)'
-        required: false
-        default: ''
+      search_keywords:
+        description: 'Enter the exact topics, names, phrases, or keywords you want to search for (comma-separated, e.g. "Claude Code, Veo, AI coding agents")'
+        required: true
         type: string
       candidate_urls:
         description: 'Optional public X post URLs to verify (whitespace/newline separated)'
@@ -94,6 +93,7 @@ jobs:
 
       - name: Validate Inputs
         env:
+          SEARCH_KEYWORDS: ${{ inputs.search_keywords }}
           MAX_CANDIDATES: ${{ inputs.max_candidates }}
           MIN_VIEWS: ${{ inputs.min_views }}
           HOURS: ${{ inputs.hours }}
@@ -104,6 +104,10 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "[INPUT ERROR] $1" >&2; exit 1; }
+          # search_keywords must contain at least one non-empty term
+          if [[ -z "${SEARCH_KEYWORDS//[[:space:],]/}" ]]; then
+            fail "search_keywords must contain at least one non-empty comma-separated term"
+          fi
           for pair in \
             "max_candidates:$MAX_CANDIDATES" \
             "min_views:$MIN_VIEWS" \
@@ -124,7 +128,7 @@ jobs:
       - name: Discover and Verify Qualifying X Posts
         env:
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
-          TOPICS: ${{ inputs.topics }}
+          SEARCH_KEYWORDS: ${{ inputs.search_keywords }}
           CANDIDATE_URLS: ${{ inputs.candidate_urls }}
           DISCOVER_EXA: ${{ inputs.discover_exa }}
           MAX_CANDIDATES: ${{ inputs.max_candidates }}
@@ -149,10 +153,16 @@ jobs:
             --retention-days "$RETENTION_DAYS"
             --output-dir "viral-links"
           )
-          [[ -n "$TOPICS" ]] && args+=(--topics "$TOPICS")
-          [[ "$DISCOVER_EXA" == "true" ]] && args+=(--discover-exa)
-          [[ "$PRUNE" == "true" ]] && args+=(--prune)
-          [[ "$DISCOVER_HN" == "true" ]] && args+=(--discover-hn)
+          if [[ "$DISCOVER_EXA" == "true" ]]; then
+            # The keywords you typed drive discovery (passed through verbatim).
+            args+=(--discover-exa --search-keywords "$SEARCH_KEYWORDS")
+          fi
+          if [[ "$PRUNE" == "true" ]]; then
+            args+=(--prune)
+          fi
+          if [[ "$DISCOVER_HN" == "true" ]]; then
+            args+=(--discover-hn)
+          fi
           if [[ "$DISCOVER_EXA" == "true" && -z "${EXA_API_KEY:-}" ]]; then
             echo "[WARN] discover_exa is on but EXA_API_KEY secret is not set; falling back." >&2
           fi
@@ -191,6 +201,8 @@ jobs:
           else
             echo "### Viral X link discovery: no new qualifying records" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Automated discovery of qualifying posts is often empty. Provide the" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`candidate_urls\` input, or check the EXA_API_KEY secret is configured." >> "$GITHUB_STEP_SUMMARY"
+            echo "Searched for: \`${{ inputs.search_keywords }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Automated discovery of qualifying posts is often empty. Add more keywords in" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`search_keywords\`, provide \`candidate_urls\`, or check EXA_API_KEY." >> "$GITHUB_STEP_SUMMARY"
           fi
