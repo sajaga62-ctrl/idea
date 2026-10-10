@@ -1,0 +1,138 @@
+name: Find Viral X AI-Demo Links
+
+# Manual-only workflow. No cron schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: 'Discovery query (used by the free Hacker News aggregator)'
+        required: false
+        default: 'AI model demo'
+        type: string
+      candidate_urls:
+        description: 'Optional public X post URLs to verify (whitespace/newline separated)'
+        required: false
+        default: ''
+        type: string
+      max_candidates:
+        description: 'Maximum number of candidates to verify'
+        required: false
+        default: 25
+        type: number
+      min_views:
+        description: 'Minimum verified view count'
+        required: false
+        default: 50000
+        type: number
+      hours:
+        description: 'Rolling time window in hours'
+        required: false
+        default: 24
+        type: number
+      discover_hn:
+        description: 'Also run the free best-effort Hacker News discovery source'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: find-viral-x-links-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  find-links:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate Inputs
+        env:
+          MAX_CANDIDATES: ${{ inputs.max_candidates }}
+          MIN_VIEWS: ${{ inputs.min_views }}
+          HOURS: ${{ inputs.hours }}
+        run: |
+          set -euo pipefail
+          fail() { echo "[INPUT ERROR] $1" >&2; exit 1; }
+          [[ "$MAX_CANDIDATES" =~ ^[0-9]+$ ]] || fail "max_candidates must be a positive integer"
+          [[ "$MIN_VIEWS" =~ ^[0-9]+$ ]] || fail "min_views must be a non-negative integer"
+          [[ "$HOURS" =~ ^[0-9]+$ ]] || fail "hours must be a positive integer"
+          (( MAX_CANDIDATES >= 1 )) || fail "max_candidates must be >= 1"
+          (( HOURS >= 1 )) || fail "hours must be >= 1"
+          echo "Inputs validated: max_candidates=$MAX_CANDIDATES min_views=$MIN_VIEWS hours=$HOURS"
+
+      - name: Discover and Verify Qualifying X Posts
+        env:
+          QUERY: ${{ inputs.query }}
+          CANDIDATE_URLS: ${{ inputs.candidate_urls }}
+          MAX_CANDIDATES: ${{ inputs.max_candidates }}
+          MIN_VIEWS: ${{ inputs.min_views }}
+          HOURS: ${{ inputs.hours }}
+          DISCOVER_HN: ${{ inputs.discover_hn }}
+        run: |
+          set -euo pipefail
+          args=(
+            --query "$QUERY"
+            --candidate-urls "$CANDIDATE_URLS"
+            --max-candidates "$MAX_CANDIDATES"
+            --min-views "$MIN_VIEWS"
+            --hours "$HOURS"
+            --output-dir "viral-links"
+          )
+          if [[ "$DISCOVER_HN" == "true" ]]; then
+            args+=(--discover-hn)
+          fi
+          python -m src.viral_finder "${args[@]}"
+
+      - name: Commit Newly Verified Records
+        id: commit
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d viral-links ]]; then
+            echo "No qualifying records were verified; nothing to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git add viral-links/
+          if git diff --staged --quiet; then
+            echo "No new qualifying records to commit (all already present)."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat(viral-links): add verified viral AI-demo X links for $(date -u +%Y-%m-%d)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "${GITHUB_REF_NAME}"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [[ "${{ steps.commit.outputs.committed }}" == "true" ]]; then
+            echo "### Viral X link discovery: new qualifying records committed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Viral X link discovery: no new qualifying records" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Automated discovery of qualifying posts is often empty. Use the" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`candidate_urls\` input with public X post URLs to verify them." >> "$GITHUB_STEP_SUMMARY"
+          fi
