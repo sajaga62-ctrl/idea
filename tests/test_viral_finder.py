@@ -14,6 +14,11 @@ import pytest
 
 from src import viral_finder as vf
 from src.downloader import extract_post_id
+from src.exa_search import (
+    SearchHit,
+    SearchProviderError,
+    SearchProviderExhaustedError,
+)
 
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
@@ -471,6 +476,161 @@ class TestDownloaderRegression:
         assert validate_x_url("https://twitter.com/u/status/42") == "42"
         with pytest.raises(InvalidURLError):
             validate_x_url("https://example.com/status/1")
+
+
+# ---------------------------------------------------------------------------
+# Mirror/aggregator extraction (how Exa hits become candidate X posts)
+# ---------------------------------------------------------------------------
+
+
+class TestMirrorExtraction:
+    @pytest.mark.parametrize(
+        "url, expected",
+        [
+            ("https://nitter.cf/spira_lab_ai/status/2107509453889401136", ["2107509453889401136"]),
+            ("https://www.24vids.com/video/x-abc-tw-2105704169009246248", ["2105704169009246248"]),
+            ("https://twirank.stream/video/2105476752449679686", ["2105476752449679686"]),
+            ("https://example.com/post/2016925155277361423", ["2016925155277361423"]),
+            ("https://x.com/OpenAI/profile", []),
+            ("https://example.com/status/123", []),  # too short to be a snowflake id
+            ("", []),
+            (None, []),
+        ],
+    )
+    def test_extract_mirror_status_ids(self, url, expected):
+        assert vf.extract_mirror_status_ids(url) == expected
+
+    def test_direct_url_wins(self):
+        urls, kind = vf.candidate_urls_from_search_hit(
+            "https://x.com/OpenAI/status/1790637656616943991"
+        )
+        assert kind == "direct"
+        assert urls == ["https://x.com/OpenAI/status/1790637656616943991"]
+
+    def test_mirror_url_yields_canonical_post_url(self):
+        urls, kind = vf.candidate_urls_from_search_hit(
+            "https://nitter.cf/spira_lab_ai/status/2107509453889401136"
+        )
+        assert kind == "mirror"
+        assert urls == ["https://x.com/i/web/status/2107509453889401136"]
+
+    def test_non_status_hit_is_none(self):
+        urls, kind = vf.candidate_urls_from_search_hit("https://x.com/OpenAI")
+        assert urls == []
+        assert kind == "none"
+
+
+# ---------------------------------------------------------------------------
+# Exa discovery pipeline
+# ---------------------------------------------------------------------------
+
+
+class FakeProvider:
+    name = "fake"
+
+    def __init__(self, hits=None, *, configured=True, error=None):
+        self.hits = hits or []
+        self.configured = configured
+        self.error = error
+        self.calls = []
+        self.total_cost_usd = 0.25
+
+    def is_configured(self):
+        return self.configured
+
+    def search(self, query, **kwargs):
+        self.calls.append(query)
+        if self.error:
+            raise self.error
+        return list(self.hits)
+
+
+class TestDiscoverWithExa:
+    def test_extracts_direct_and_mirror_and_discards_rest(self):
+        provider = FakeProvider(
+            hits=[
+                SearchHit("https://x.com/a/status/1111111111111111111"),
+                SearchHit("https://nitter.cf/u/status/2222222222222222222"),
+                SearchHit("https://x.com/someprofile"),
+            ]
+        )
+        candidates, stats = vf.discover_with_exa(
+            provider, ["ai demo"], max_queries=1, log=lambda _m: None
+        )
+
+        assert candidates == [
+            "https://x.com/a/status/1111111111111111111",
+            "https://x.com/i/web/status/2222222222222222222",
+        ]
+        assert stats.queries_run == 1
+        assert stats.direct_hits == 1
+        assert stats.mirror_hits == 1
+        assert stats.non_status_discarded == 1
+        assert stats.status_hits == 2
+        assert stats.cost_usd == 0.25
+
+    def test_respects_query_cap(self):
+        provider = FakeProvider(hits=[])
+        _candidates, stats = vf.discover_with_exa(
+            provider, ["ai demo"], max_queries=1, log=lambda _m: None
+        )
+        assert stats.queries_run == 1
+        assert len(provider.calls) == 1
+        assert any("cap" in note for note in stats.notes)
+
+    def test_exhaustion_stops_gracefully(self):
+        provider = FakeProvider(error=SearchProviderExhaustedError("credits used"))
+        candidates, stats = vf.discover_with_exa(provider, ["ai demo"], log=lambda _m: None)
+        assert candidates == []
+        assert len(provider.calls) == 1
+        assert any("exhausted" in note for note in stats.notes)
+
+    def test_other_errors_are_noted_and_skipped(self):
+        provider = FakeProvider(error=SearchProviderError("boom"))
+        candidates, stats = vf.discover_with_exa(provider, ["ai demo"], log=lambda _m: None)
+        assert candidates == []
+        assert stats.queries_run == 0
+        assert len(stats.notes) >= 1
+
+    def test_unconfigured_provider_returns_nothing(self):
+        provider = FakeProvider(configured=False)
+        candidates, stats = vf.discover_with_exa(provider, ["ai demo"], log=lambda _m: None)
+        assert candidates == []
+        assert provider.calls == []
+        assert any("not configured" in note for note in stats.notes)
+
+
+# ---------------------------------------------------------------------------
+# Retention pruning
+# ---------------------------------------------------------------------------
+
+
+class TestPruning:
+    def test_removes_only_expired_dated_files(self, tmp_path):
+        (tmp_path / "2026-09-01.json").write_text("{}")
+        (tmp_path / "2026-10-09.json").write_text("{}")
+        (tmp_path / "README.md").write_text("keep me")
+
+        removed = vf.prune_old_results(tmp_path, 30, NOW)
+
+        assert [p.name for p in removed] == ["2026-09-01.json"]
+        assert (tmp_path / "2026-10-09.json").exists()
+        assert (tmp_path / "README.md").exists()
+
+    def test_non_positive_retention_keeps_everything(self, tmp_path):
+        (tmp_path / "2020-01-01.json").write_text("{}")
+        assert vf.prune_old_results(tmp_path, 0, NOW) == []
+        assert (tmp_path / "2020-01-01.json").exists()
+
+
+class TestMainFallback:
+    def test_falls_back_without_exa_key(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.delenv("EXA_API_KEY", raising=False)
+        code = vf.main(["--discover-exa", "--output-dir", str(tmp_path)])
+        assert code == 0
+        assert list(tmp_path.iterdir()) == []
+        out = capsys.readouterr().out
+        assert "skipped" in out or "No candidates" in out
 
 
 # ---------------------------------------------------------------------------

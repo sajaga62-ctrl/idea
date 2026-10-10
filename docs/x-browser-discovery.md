@@ -125,9 +125,39 @@ interchangeability** — dispatch the workflow once and compare.
 
 ## 7. Limitations (honest)
 
-- No automated high-yield discovery: supply `candidate_urls`, or rely on the
-  low-yield HN source.
+- Discovery is now automated via the free **Exa** search API (see §8); the HN
+  source and manual `candidate_urls` remain as fallbacks.
 - View counts come from public GraphQL metadata; if a post's count is
   unavailable it is **excluded**, never guessed.
 - Private/protected/deleted posts are excluded (no login, no cookies).
 - No CAPTCHA/anti-bot bypass is attempted anywhere.
+
+---
+
+## 8. Update (implemented): Exa-based discovery
+
+Browser search and direct `x.com` pages stay blocked in CI, so discovery now
+uses the free **Exa** search API (`POST https://api.exa.ai/search`, `x-api-key`
+header, free tier with no payment method, credits refresh monthly).
+
+**Measured behaviour (real key, real queries):**
+
+| Query style | x.com status links | Mirror/aggregator links embedding a post id |
+| :--- | :--- | :--- |
+| Semantic (`computer use agent demo video`) | 0 | 0 |
+| `includeDomains: [x.com, twitter.com]` | 0 | 0 |
+| `site:x.com …` | 0 (returns junk) | 0 |
+| Topic **+ `twitter x post video`** | 0 | **yes** |
+
+Exa does **not** index `x.com/…/status/…` pages, but it *does* index
+aggregator/mirror sites that embed the numeric post id (e.g.
+`nitter.cf/<user>/status/<id>`, `24vids.com/…-tw-<id>`, `twirank.stream/video/<id>`).
+The pipeline extracts those ids and verifies them against the real canonical
+`https://x.com/i/web/status/<id>`, so a mirror hit becomes a genuinely verified
+post. A live run (8 queries) produced 5 such candidates, all of which resolved
+as real X posts with real view counts (e.g. 1.36M, 8.4M, 21M views); they were
+correctly excluded only because they predated the rolling 24-hour window.
+
+This is the implemented path in `src/viral_finder.py` + `src/exa_search.py`. It
+still never fabricates metadata: every record is verified through the anonymous
+endpoints described in §3.

@@ -4,16 +4,21 @@ name: Find Viral X AI-Demo Links
 on:
   workflow_dispatch:
     inputs:
-      query:
-        description: 'Discovery query (used by the free Hacker News aggregator)'
+      topics:
+        description: 'Comma-separated discovery topics (blank = built-in seed topics)'
         required: false
-        default: 'AI model demo'
+        default: ''
         type: string
       candidate_urls:
         description: 'Optional public X post URLs to verify (whitespace/newline separated)'
         required: false
         default: ''
         type: string
+      discover_exa:
+        description: 'Discover candidates via the free Exa search API (requires EXA_API_KEY secret)'
+        required: false
+        default: true
+        type: boolean
       max_candidates:
         description: 'Maximum number of candidates to verify'
         required: false
@@ -29,6 +34,31 @@ on:
         required: false
         default: 24
         type: number
+      per_run_query_cap:
+        description: 'Maximum Exa queries this run'
+        required: false
+        default: 25
+        type: number
+      exa_num_results:
+        description: 'Exa results per query (1-100)'
+        required: false
+        default: 10
+        type: number
+      exa_since_hours:
+        description: 'Bias Exa to content published within N hours (0 = no filter)'
+        required: false
+        default: 0
+        type: number
+      retention_days:
+        description: 'Prune result files older than N days'
+        required: false
+        default: 30
+        type: number
+      prune:
+        description: 'Delete result files older than retention_days'
+        required: false
+        default: true
+        type: boolean
       discover_hn:
         description: 'Also run the free best-effort Hacker News discovery source'
         required: false
@@ -67,36 +97,64 @@ jobs:
           MAX_CANDIDATES: ${{ inputs.max_candidates }}
           MIN_VIEWS: ${{ inputs.min_views }}
           HOURS: ${{ inputs.hours }}
+          PER_RUN_QUERY_CAP: ${{ inputs.per_run_query_cap }}
+          EXA_NUM_RESULTS: ${{ inputs.exa_num_results }}
+          EXA_SINCE_HOURS: ${{ inputs.exa_since_hours }}
+          RETENTION_DAYS: ${{ inputs.retention_days }}
         run: |
           set -euo pipefail
           fail() { echo "[INPUT ERROR] $1" >&2; exit 1; }
-          [[ "$MAX_CANDIDATES" =~ ^[0-9]+$ ]] || fail "max_candidates must be a positive integer"
-          [[ "$MIN_VIEWS" =~ ^[0-9]+$ ]] || fail "min_views must be a non-negative integer"
-          [[ "$HOURS" =~ ^[0-9]+$ ]] || fail "hours must be a positive integer"
+          for pair in \
+            "max_candidates:$MAX_CANDIDATES" \
+            "min_views:$MIN_VIEWS" \
+            "hours:$HOURS" \
+            "per_run_query_cap:$PER_RUN_QUERY_CAP" \
+            "exa_num_results:$EXA_NUM_RESULTS" \
+            "exa_since_hours:$EXA_SINCE_HOURS" \
+            "retention_days:$RETENTION_DAYS"; do
+            name="${pair%%:*}"; value="${pair#*:}"
+            [[ "$value" =~ ^[0-9]+$ ]] || fail "$name must be a non-negative integer"
+          done
           (( MAX_CANDIDATES >= 1 )) || fail "max_candidates must be >= 1"
           (( HOURS >= 1 )) || fail "hours must be >= 1"
+          (( PER_RUN_QUERY_CAP >= 1 )) || fail "per_run_query_cap must be >= 1"
+          (( EXA_NUM_RESULTS >= 1 && EXA_NUM_RESULTS <= 100 )) || fail "exa_num_results must be 1-100"
           echo "Inputs validated: max_candidates=$MAX_CANDIDATES min_views=$MIN_VIEWS hours=$HOURS"
 
       - name: Discover and Verify Qualifying X Posts
         env:
-          QUERY: ${{ inputs.query }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          TOPICS: ${{ inputs.topics }}
           CANDIDATE_URLS: ${{ inputs.candidate_urls }}
+          DISCOVER_EXA: ${{ inputs.discover_exa }}
           MAX_CANDIDATES: ${{ inputs.max_candidates }}
           MIN_VIEWS: ${{ inputs.min_views }}
           HOURS: ${{ inputs.hours }}
+          PER_RUN_QUERY_CAP: ${{ inputs.per_run_query_cap }}
+          EXA_NUM_RESULTS: ${{ inputs.exa_num_results }}
+          EXA_SINCE_HOURS: ${{ inputs.exa_since_hours }}
+          RETENTION_DAYS: ${{ inputs.retention_days }}
+          PRUNE: ${{ inputs.prune }}
           DISCOVER_HN: ${{ inputs.discover_hn }}
         run: |
           set -euo pipefail
           args=(
-            --query "$QUERY"
             --candidate-urls "$CANDIDATE_URLS"
             --max-candidates "$MAX_CANDIDATES"
             --min-views "$MIN_VIEWS"
             --hours "$HOURS"
+            --per-run-query-cap "$PER_RUN_QUERY_CAP"
+            --exa-num-results "$EXA_NUM_RESULTS"
+            --exa-since-hours "$EXA_SINCE_HOURS"
+            --retention-days "$RETENTION_DAYS"
             --output-dir "viral-links"
           )
-          if [[ "$DISCOVER_HN" == "true" ]]; then
-            args+=(--discover-hn)
+          [[ -n "$TOPICS" ]] && args+=(--topics "$TOPICS")
+          [[ "$DISCOVER_EXA" == "true" ]] && args+=(--discover-exa)
+          [[ "$PRUNE" == "true" ]] && args+=(--prune)
+          [[ "$DISCOVER_HN" == "true" ]] && args+=(--discover-hn)
+          if [[ "$DISCOVER_EXA" == "true" && -z "${EXA_API_KEY:-}" ]]; then
+            echo "[WARN] discover_exa is on but EXA_API_KEY secret is not set; falling back." >&2
           fi
           python -m src.viral_finder "${args[@]}"
 
@@ -133,6 +191,6 @@ jobs:
           else
             echo "### Viral X link discovery: no new qualifying records" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Automated discovery of qualifying posts is often empty. Use the" >> "$GITHUB_STEP_SUMMARY"
-            echo "\`candidate_urls\` input with public X post URLs to verify them." >> "$GITHUB_STEP_SUMMARY"
+            echo "Automated discovery of qualifying posts is often empty. Provide the" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`candidate_urls\` input, or check the EXA_API_KEY secret is configured." >> "$GITHUB_STEP_SUMMARY"
           fi

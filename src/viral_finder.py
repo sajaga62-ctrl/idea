@@ -1,9 +1,9 @@
 """Free ($0) viral AI-demo link finder for X (Twitter).
 
-Discovers *candidate* public X post URLs (manual ingestion plus a best-effort
-free aggregator) and then **verifies** each candidate with unauthenticated,
-permitted metadata: yt-dlp's public X/Twitter extractor and a ranged HTTP
-check against the video CDN.
+Discovers *candidate* public X post URLs via the free Exa search API (primary),
+manual ingestion, and a best-effort free aggregator, then **verifies** each
+candidate with unauthenticated, permitted metadata: yt-dlp's public X/Twitter
+extractor and a ranged HTTP check against the video CDN.
 
 Only posts that satisfy *every* qualifying condition are written to
 ``viral-links/YYYY-MM-DD.json``:
@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -35,11 +37,23 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 import yt_dlp
 
 from src.downloader import extract_post_id, validate_x_url
+from src.exa_search import (
+    DEFAULT_EXA_NUM_RESULTS,
+    DEFAULT_PER_RUN_QUERY_CAP,
+    DEFAULT_TOPICS,
+    ExaSearchProvider,
+    SearchProvider,
+    SearchProviderError,
+    SearchProviderExhaustedError,
+    SearchProviderRateLimitError,
+    build_query_templates,
+)
 
 DEFAULT_MIN_VIEWS = 50_000
 DEFAULT_HOURS = 24
 DEFAULT_MAX_CANDIDATES = 25
 DEFAULT_OUTPUT_DIR = "viral-links"
+DEFAULT_RETENTION_DAYS = 30
 
 # Evidence provenance recorded on each verified record.
 EVIDENCE_SOURCE = (
@@ -229,6 +243,45 @@ def extract_candidate_urls(text: str) -> List[str]:
             seen.add(normalized)
             found.append(normalized)
     return found
+
+
+# Exa cannot index x.com status pages directly, but aggregator/mirror/video-embed
+# sites expose the numeric post id in their own paths, and those pages ARE
+# indexed. We extract those ids here and verify them against the real canonical
+# X URL, so a mirror hit becomes a candidate post link.
+_MIRROR_ID_PATTERNS = (
+    re.compile(r"/status(?:es)?/(\d{15,25})", re.IGNORECASE),
+    re.compile(r"-tw-(\d{15,25})", re.IGNORECASE),
+    re.compile(r"/videos?/(\d{15,25})", re.IGNORECASE),
+    re.compile(r"/(?:post|posts|p)/(\d{15,25})", re.IGNORECASE),
+)
+
+
+def extract_mirror_status_ids(url: str) -> List[str]:
+    """Extracts embedded X post ids from mirror/aggregator URLs."""
+    if not url or not isinstance(url, str):
+        return []
+    ids: List[str] = []
+    for pattern in _MIRROR_ID_PATTERNS:
+        for match in pattern.finditer(url):
+            ids.append(match.group(1))
+    return list(dict.fromkeys(ids))
+
+
+def candidate_urls_from_search_hit(url: str) -> Tuple[List[str], str]:
+    """Turns one search hit into canonical X post URLs.
+
+    Returns ``(urls, kind)`` where ``kind`` is ``"direct"``, ``"mirror"`` or
+    ``"none"``. A direct x.com/twitter.com status URL wins; otherwise an id
+    embedded in a mirror/aggregator path is used and verified on the real post.
+    """
+    direct = normalize_post_url(url)
+    if direct:
+        return [direct], "direct"
+    ids = extract_mirror_status_ids(url)
+    if ids:
+        return [f"https://x.com/i/web/status/{post_id}" for post_id in ids], "mirror"
+    return [], "none"
 
 
 def dedupe_candidates(urls: Iterable[object]) -> List[str]:
@@ -619,8 +672,144 @@ def discover_from_hackernews(
 
 
 # ---------------------------------------------------------------------------
+# Primary discovery source (Exa, free tier)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DiscoveryStats:
+    """Observability for one discovery run (provider, hit rate, cost)."""
+
+    provider: str
+    queries_run: int = 0
+    results_total: int = 0
+    direct_hits: int = 0
+    mirror_hits: int = 0
+    non_status_discarded: int = 0
+    cost_usd: float = 0.0
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def status_hits(self) -> int:
+        return self.direct_hits + self.mirror_hits
+
+    @property
+    def status_hit_rate(self) -> float:
+        if self.results_total == 0:
+            return 0.0
+        return self.status_hits / self.results_total
+
+
+def discover_with_exa(
+    provider: SearchProvider,
+    topics: Sequence[str] = DEFAULT_TOPICS,
+    *,
+    max_queries: int = DEFAULT_PER_RUN_QUERY_CAP,
+    num_results: int = DEFAULT_EXA_NUM_RESULTS,
+    start_published_date: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> Tuple[List[str], DiscoveryStats]:
+    """Discovers candidate X post URLs with a search provider (Exa).
+
+    Returns de-duplicated candidate URLs plus :class:`DiscoveryStats`.
+    Non-status results (profiles/homepages) are discarded and counted so query
+    templates can be tuned. Provider exhaustion or rate limiting stops the run
+    gracefully instead of retrying aggressively.
+    """
+    stats = DiscoveryStats(provider=getattr(provider, "name", "unknown"))
+
+    if not provider.is_configured():
+        stats.notes.append("provider not configured (missing API key)")
+        log("[INFO] Exa discovery skipped: no API key configured; falling back.")
+        return [], stats
+
+    templates = build_query_templates(topics)
+    candidates: List[str] = []
+
+    for template in templates:
+        if stats.queries_run >= max_queries:
+            stats.notes.append(f"per-run query cap reached ({max_queries})")
+            break
+        try:
+            hits = provider.search(
+                template.query,
+                num_results=num_results,
+                include_domains=list(template.include_domains) or None,
+                start_published_date=start_published_date,
+            )
+        except SearchProviderExhaustedError as exc:
+            stats.notes.append(f"provider exhausted: {exc}")
+            log(f"[WARN] Exa free allowance exhausted: {exc}")
+            break
+        except SearchProviderRateLimitError as exc:
+            stats.notes.append(f"rate limited: {exc}")
+            log(f"[WARN] Exa rate limited: {exc}")
+            break
+        except SearchProviderError as exc:
+            stats.notes.append(f"{template.label}: {exc}")
+            log(f"[WARN] Exa query failed for {template.label}: {exc}")
+            continue
+
+        stats.queries_run += 1
+        stats.results_total += len(hits)
+        for hit in hits:
+            urls, kind = candidate_urls_from_search_hit(hit.url)
+            if kind == "direct":
+                candidates.extend(urls)
+                stats.direct_hits += len(urls)
+            elif kind == "mirror":
+                candidates.extend(urls)
+                stats.mirror_hits += len(urls)
+            else:
+                stats.non_status_discarded += 1
+
+    stats.cost_usd = float(getattr(provider, "total_cost_usd", 0.0) or 0.0)
+    log(
+        f"[INFO] Exa discovery: {stats.queries_run} quer(y/ies), "
+        f"{stats.direct_hits} direct + {stats.mirror_hits} mirror status link(s), "
+        f"{stats.non_status_discarded} non-status discarded, "
+        f"hit-rate {stats.status_hit_rate:.0%}, cost ${stats.cost_usd:.4f}."
+    )
+    return dedupe_candidates(candidates), stats
+
+
+# ---------------------------------------------------------------------------
 # Result persistence
 # ---------------------------------------------------------------------------
+
+
+_DATE_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.json$")
+
+
+def prune_old_results(
+    output_dir: Path,
+    retention_days: int,
+    now: Optional[datetime] = None,
+) -> List[Path]:
+    """Deletes daily result files older than ``retention_days`` (UTC).
+
+    Non-dated files (e.g. a README) are never touched. Returns deleted paths.
+    """
+    if retention_days <= 0:
+        return []
+    now = now or datetime.now(timezone.utc)
+    if not output_dir.exists():
+        return []
+
+    cutoff = now.astimezone(timezone.utc).date() - timedelta(days=retention_days)
+    removed: List[Path] = []
+    for path in sorted(output_dir.glob("*.json")):
+        match = _DATE_FILE_RE.match(path.name)
+        if not match:
+            continue
+        try:
+            file_date = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if file_date < cutoff:
+            path.unlink()
+            removed.append(path)
+    return removed
 
 
 def record_to_json_safe(record: Dict) -> Dict:
@@ -790,6 +979,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for JSON results."
     )
     parser.add_argument(
+        "--discover-exa",
+        dest="discover_exa",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Discover candidates using the free Exa search API.",
+    )
+    parser.add_argument(
+        "--exa-api-key",
+        default="",
+        help="Exa API key (defaults to the EXA_API_KEY environment variable).",
+    )
+    parser.add_argument(
+        "--topics",
+        default="",
+        help="Comma-separated discovery topics (defaults to built-in seed topics).",
+    )
+    parser.add_argument(
+        "--per-run-query-cap",
+        type=int,
+        default=DEFAULT_PER_RUN_QUERY_CAP,
+        help=f"Maximum Exa queries per run (default: {DEFAULT_PER_RUN_QUERY_CAP}).",
+    )
+    parser.add_argument(
+        "--exa-num-results",
+        type=int,
+        default=DEFAULT_EXA_NUM_RESULTS,
+        help=f"Exa results per query, 1-100 (default: {DEFAULT_EXA_NUM_RESULTS}).",
+    )
+    parser.add_argument(
+        "--exa-since-hours",
+        type=int,
+        default=0,
+        help="Bias Exa to content published within N hours (0 = no date filter).",
+    )
+    parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=DEFAULT_RETENTION_DAYS,
+        help=f"Prune result files older than N days (default: {DEFAULT_RETENTION_DAYS}).",
+    )
+    parser.add_argument(
+        "--prune",
+        dest="prune",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Delete result files older than --retention-days.",
+    )
+    parser.add_argument(
         "--discover-hn",
         dest="discover_hn",
         action=argparse.BooleanOptionalAction,
@@ -811,9 +1048,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.hours < 1:
         print("[ERROR] --hours must be >= 1", file=sys.stderr)
         return 2
+    if args.per_run_query_cap < 1:
+        print("[ERROR] --per-run-query-cap must be >= 1", file=sys.stderr)
+        return 2
+    if not 1 <= args.exa_num_results <= 100:
+        print("[ERROR] --exa-num-results must be between 1 and 100", file=sys.stderr)
+        return 2
+    if args.retention_days < 0:
+        print("[ERROR] --retention-days must be >= 0", file=sys.stderr)
+        return 2
+    if args.exa_since_hours < 0:
+        print("[ERROR] --exa-since-hours must be >= 0", file=sys.stderr)
+        return 2
 
     now = datetime.now(timezone.utc)
     candidates = _split_candidates(args.candidate_urls)
+    exa_stats: Optional[DiscoveryStats] = None
 
     if args.candidate_file:
         candidate_file = Path(args.candidate_file)
@@ -821,6 +1071,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             candidates.extend(_split_candidates(candidate_file.read_text(encoding="utf-8")))
         else:
             print(f"[WARN] candidate file not found: {candidate_file}")
+
+    if args.discover_exa:
+        api_key = args.exa_api_key or os.getenv("EXA_API_KEY", "")
+        provider = ExaSearchProvider(api_key)
+        topics = [t.strip() for t in args.topics.split(",") if t.strip()] or list(DEFAULT_TOPICS)
+        start_date = None
+        if args.exa_since_hours > 0:
+            start_date = (now - timedelta(hours=args.exa_since_hours)).replace(
+                microsecond=0
+            ).isoformat()
+        exa_candidates, exa_stats = discover_with_exa(
+            provider,
+            topics,
+            max_queries=args.per_run_query_cap,
+            num_results=args.exa_num_results,
+            start_published_date=start_date,
+        )
+        candidates.extend(exa_candidates)
 
     if args.discover_hn:
         print(f"[INFO] Running best-effort Hacker News discovery for query={args.query!r} ...")
@@ -858,9 +1126,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_dir = Path(args.output_dir)
     written = write_results(records, output_dir, now)
 
+    pruned: List[Path] = []
+    if args.prune:
+        pruned = prune_old_results(output_dir, args.retention_days, now)
+
     print("\n=== Summary ===")
+    if exa_stats is not None:
+        print(
+            f"Exa discovery               : {exa_stats.queries_run} queries, "
+            f"{exa_stats.direct_hits} direct + {exa_stats.mirror_hits} mirror status links, "
+            f"{exa_stats.non_status_discarded} non-status discarded, "
+            f"cost ${exa_stats.cost_usd:.4f}"
+        )
+        for note in exa_stats.notes:
+            print(f"  - {note}")
     print(f"Verified qualifying records : {len(records)}")
     print(f"Excluded candidates         : {len(rejections)}")
+    if args.prune:
+        print(f"Pruned old result files     : {len(pruned)} (retention {args.retention_days}d)")
     if written:
         print(f"Results file                : {written}")
     else:
